@@ -1,0 +1,244 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from aiogram import Bot, F, Router
+from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import (
+    ChatMemberUpdatedFilter, Command, CommandObject, JOIN_TRANSITION, LEAVE_TRANSITION,
+)
+from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
+
+from app.cleanup import MessageCleanup
+from app.config import Settings
+from app.domain import contains_points_word, is_jackpot
+from app.moderation import CaptchaManager, _mention, mute_member
+from app.storage import Storage
+
+logger = logging.getLogger(__name__)
+
+GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+PRIVILEGED_STATUSES = {
+    ChatMemberStatus.CREATOR,
+    ChatMemberStatus.ADMINISTRATOR,
+}
+
+
+def register_handlers(
+    captcha: CaptchaManager, storage: Storage, settings: Settings,
+    cleanup: MessageCleanup,
+) -> Router:
+    local_router = Router(name="moderation")
+    moderation_lock = asyncio.Lock()
+
+    @local_router.message.outer_middleware()
+    async def remember_sender(
+        handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
+        message: Message,
+        data: dict[str, Any],
+    ) -> Any:
+        if message.chat.type in GROUP_TYPES:
+            users = list(message.new_chat_members or [])
+            if message.from_user and not message.sender_chat:
+                users.append(message.from_user)
+            for user in users:
+                if not user.is_bot:
+                    await storage.remember_user(message.chat.id, user.id, user.username)
+        return await handler(message, data)
+
+    @local_router.chat_member.outer_middleware()
+    async def remember_member(
+        handler: Callable[[ChatMemberUpdated, dict[str, Any]], Awaitable[Any]],
+        event: ChatMemberUpdated,
+        data: dict[str, Any],
+    ) -> Any:
+        user = event.new_chat_member.user
+        if event.chat.type in GROUP_TYPES and not user.is_bot:
+            await storage.remember_user(event.chat.id, user.id, user.username)
+        return await handler(event, data)
+
+    @local_router.message(Command("warn"))
+    async def warn(message: Message, bot: Bot, command: CommandObject) -> None:
+        if message.chat.type not in GROUP_TYPES:
+            return
+        if message.sender_chat:
+            # Only anonymous admins speaking as this group are trusted.
+            is_admin = message.sender_chat.id == message.chat.id
+        elif message.from_user and not message.from_user.is_bot:
+            sender = await bot.get_chat_member(message.chat.id, message.from_user.id)
+            is_admin = sender.status in PRIVILEGED_STATUSES
+        else:
+            is_admin = False
+        if not is_admin:
+            await message.answer("Команда /warn доступна только администраторам чата.")
+            return
+        if message.chat.type != ChatType.SUPERGROUP:
+            await message.answer("Для предупреждений с мутом нужна супергруппа.")
+            return
+
+        username = None
+        reply = message.reply_to_message
+        if command.args:
+            if not re.fullmatch(r"@[A-Za-z0-9_]{1,32}", command.args.strip()):
+                await message.answer("Используйте /warn @username или /warn ответом на сообщение.")
+                return
+            username = command.args.strip()[1:]
+            user_id = await storage.find_user_id(message.chat.id, username)
+            if (
+                reply and reply.from_user and not reply.sender_chat
+                and (reply.from_user.username or "").casefold() == username.casefold()
+            ):
+                user_id = reply.from_user.id
+        elif reply and reply.from_user and not reply.sender_chat:
+            user_id = reply.from_user.id
+        else:
+            await message.answer("Используйте /warn @username или /warn ответом на сообщение.")
+            return
+        if user_id is None:
+            await message.answer(
+                "Пользователь пока неизвестен боту. Отправьте /warn ответом на его сообщение."
+            )
+            return
+
+        async with moderation_lock:
+            try:
+                target = await bot.get_chat_member(message.chat.id, user_id)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                await message.answer("Не удалось найти участника. Проверьте права бота в чате.")
+                return
+            user = target.user
+            await storage.remember_user(message.chat.id, user.id, user.username)
+            if username and (user.username or "").casefold() != username.casefold():
+                await message.answer(
+                    "Имя пользователя изменилось. Отправьте /warn ответом на его сообщение."
+                )
+                return
+            if target.status in PRIVILEGED_STATUSES or user.is_bot:
+                await message.answer("Нельзя выдать предупреждение администратору или боту.")
+                return
+            if target.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
+                target.status == ChatMemberStatus.RESTRICTED and not target.is_member
+            ):
+                await message.answer("Пользователь уже не состоит в чате.")
+                return
+
+            count = await storage.increment_admin_warning(message.chat.id, user.id)
+            text = (
+                f"Пользователю {_mention(user)} дано предупреждение. "
+                f"Количество предупреждений: {count}"
+            )
+            if count >= 3:
+                try:
+                    await mute_member(bot, message.chat.id, user.id, 24 * 60)
+                except (TelegramBadRequest, TelegramForbiddenError):
+                    logger.exception("Не удалось выдать мут после /warn")
+                    text += "\nНе удалось выдать мут на сутки. Проверьте права бота."
+            await message.answer(text)
+
+    @local_router.message(F.dice)
+    async def dice_policy(message: Message, bot: Bot) -> None:
+        if message.chat.type not in GROUP_TYPES or message.dice is None:
+            return
+        await cleanup.schedule(message)
+        if (
+            message.chat.type != ChatType.SUPERGROUP
+            or message.from_user is None or message.from_user.is_bot
+            or message.sender_chat is not None or message.forward_origin is not None
+            or not is_jackpot(message.dice.emoji, message.dice.value)
+        ):
+            return
+        async with moderation_lock:
+            try:
+                member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+                if member.status in PRIVILEGED_STATUSES:
+                    return
+                await mute_member(bot, message.chat.id, message.from_user.id, 5)
+            except (TelegramBadRequest, TelegramForbiddenError):
+                logger.exception("Не удалось выдать мут за джекпот")
+
+    @local_router.message(F.new_chat_members)
+    async def new_members(message: Message) -> None:
+        if message.chat.type not in GROUP_TYPES:
+            return
+        try:
+            await message.delete()
+        except (TelegramBadRequest, TelegramForbiddenError):
+            logger.exception("Не удалось удалить системное сообщение о входе")
+        for user in message.new_chat_members or []:
+            await captcha.start(message.chat.id, user)
+
+    @local_router.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+    async def member_joined(event: ChatMemberUpdated) -> None:
+        # Fallback for join paths that do not produce a service message.
+        await captcha.start(event.chat.id, event.new_chat_member.user)
+
+    @local_router.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
+    async def member_left(event: ChatMemberUpdated) -> None:
+        await captcha.forget_user(event.chat.id, event.new_chat_member.user.id)
+
+    @local_router.callback_query(F.data.startswith("captcha:"))
+    async def captcha_answer(callback: CallbackQuery) -> None:
+        if callback.data is None:
+            return
+        try:
+            _, token, raw_answer = callback.data.split(":", maxsplit=2)
+            selected = int(raw_answer)
+        except (ValueError, TypeError):
+            await callback.answer("Некорректный ответ", show_alert=True)
+            return
+
+        result = await captcha.resolve(token, callback.from_user.id, selected)
+        responses = {
+            "correct": ("Верно!", False),
+            "wrong": ("Неверно. Вы удалены из чата.", True),
+            "foreign": ("Эта задача предназначена другому пользователю.", True),
+            "expired": ("Эта задача уже недоступна.", True),
+        }
+        text, show_alert = responses[result]
+        await callback.answer(text, show_alert=show_alert)
+
+    @local_router.message(F.sticker)
+    async def forbidden_sticker(message: Message) -> None:
+        if message.chat.type not in GROUP_TYPES or message.sticker is None:
+            return
+        set_name = message.sticker.set_name
+        if set_name and set_name.casefold() in settings.forbidden_sticker_packs:
+            try:
+                await message.delete()
+            except (TelegramBadRequest, TelegramForbiddenError):
+                logger.exception("Не удалось удалить запрещённый стикер")
+
+    @local_router.message()
+    async def points_policy(message: Message, bot: Bot) -> None:
+        if (
+            message.chat.type not in GROUP_TYPES
+            or message.from_user is None
+            or message.from_user.is_bot
+            or not contains_points_word(message.text or message.caption)
+        ):
+            return
+
+        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        if member.status in PRIVILEGED_STATUSES:
+            return
+
+        async with moderation_lock:
+            attempt = await storage.increment_warning(
+                message.chat.id, message.from_user.id
+            )
+            # If data was manually changed above 3, treat it as the third attempt.
+            attempt = min(attempt, 3)
+            await message.answer(settings.warning_texts[attempt - 1])
+
+            if attempt == 3:
+                await mute_member(
+                    bot, message.chat.id, message.from_user.id, settings.mute_minutes
+                )
+                await storage.reset_warnings(message.chat.id, message.from_user.id)
+
+    return local_router

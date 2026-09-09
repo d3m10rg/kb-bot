@@ -1,0 +1,2 @@
+"""Telegram group moderation bot."""
+
