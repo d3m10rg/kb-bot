@@ -14,7 +14,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramFor
 from aiogram.filters import (
     ChatMemberUpdatedFilter, Command, CommandObject, JOIN_TRANSITION, LEAVE_TRANSITION,
 )
-from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
+from aiogram.types import CallbackQuery, ChatMemberUpdated, ChatPermissions, Message
 
 from app.cleanup import MessageCleanup
 from app.config import Settings
@@ -76,18 +76,19 @@ def register_handlers(
                         logger.exception("Не удалось обновить состояние мута пользователя %s", user.id)
         return await handler(event, data)
 
+    async def is_chat_admin(message: Message, bot: Bot) -> bool:
+        if message.sender_chat:
+            return message.sender_chat.id == message.chat.id
+        if message.from_user and not message.from_user.is_bot:
+            sender = await bot.get_chat_member(message.chat.id, message.from_user.id)
+            return sender.status in PRIVILEGED_STATUSES
+        return False
+
     @local_router.message(Command("warn"))
     async def warn(message: Message, bot: Bot, command: CommandObject) -> None:
         if message.chat.type not in GROUP_TYPES:
             return
-        if message.sender_chat:
-            # Only anonymous admins speaking as this group are trusted.
-            is_admin = message.sender_chat.id == message.chat.id
-        elif message.from_user and not message.from_user.is_bot:
-            sender = await bot.get_chat_member(message.chat.id, message.from_user.id)
-            is_admin = sender.status in PRIVILEGED_STATUSES
-        else:
-            is_admin = False
+        is_admin = await is_chat_admin(message, bot)
         if not is_admin:
             await message.answer("Команда /warn доступна только администраторам чата.")
             return
@@ -169,9 +170,83 @@ def register_handlers(
                         f"Причина (продолжение): {html.escape(reason[offset:offset + 1500])}"
                     )
 
+    @local_router.message(Command("unban"))
+    async def unban(message: Message, bot: Bot, command: CommandObject) -> None:
+        if message.chat.type not in GROUP_TYPES:
+            return
+        is_admin = await is_chat_admin(message, bot)
+        if not is_admin:
+            await message.answer("Команда /unban доступна только администраторам чата.")
+            return
+        if message.chat.type != ChatType.SUPERGROUP:
+            await message.answer("Для снятия мута нужна супергруппа.")
+            return
+
+        args = (command.args or "").strip()
+        reply = message.reply_to_message
+        username = None
+        if re.fullmatch(r"@[A-Za-z0-9_]{1,32}", args):
+            username = args[1:]
+            user_id = await storage.find_user_id(message.chat.id, username)
+            if (
+                reply and reply.from_user and not reply.sender_chat
+                and (reply.from_user.username or "").casefold() == username.casefold()
+            ):
+                user_id = reply.from_user.id
+        elif not args and reply and reply.from_user and not reply.sender_chat:
+            user_id = reply.from_user.id
+        else:
+            await message.answer("Используйте /unban @username или /unban ответом на сообщение.")
+            return
+        if user_id is None:
+            await message.answer("Пользователь пока неизвестен боту. Отправьте /unban ответом на его сообщение.")
+            return
+
+        async with moderation_lock:
+            try:
+                target = await bot.get_chat_member(message.chat.id, user_id)
+                user = target.user
+                await storage.remember_user(message.chat.id, user.id, user.username)
+                if username and (user.username or "").casefold() != username.casefold():
+                    await message.answer("Имя пользователя изменилось. Отправьте /unban ответом на его сообщение.")
+                    return
+                if target.status in {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED} or (
+                    target.status == ChatMemberStatus.RESTRICTED and not target.is_member
+                ):
+                    await message.answer("Пользователь уже не состоит в чате.")
+                    return
+                if await storage.has_challenge(message.chat.id, user.id):
+                    await message.answer("Сначала пользователь должен пройти капчу. Затем повторите /unban.")
+                    return
+                if target.status != ChatMemberStatus.RESTRICTED:
+                    await storage.clear_mute(message.chat.id, user.id)
+                    await message.answer(f"У пользователя {_mention(user)} нет мута.")
+                    return
+                # Telegram lifts individual restrictions when all permissions are True.
+                result = await bot.restrict_chat_member(
+                    chat_id=message.chat.id, user_id=user.id,
+                    permissions=ChatPermissions(**{
+                        name: True for name in ChatPermissions.model_fields
+                        if name.startswith("can_")
+                    }),
+                    use_independent_chat_permissions=True,
+                )
+                confirmed = await bot.get_chat_member(message.chat.id, user.id)
+                if not result or confirmed.status == ChatMemberStatus.RESTRICTED:
+                    raise ModerationError("Telegram не подтвердил снятие ограничений.")
+                await storage.clear_mute(message.chat.id, user.id)
+            except (ModerationError, TelegramAPIError) as error:
+                logger.exception("Не удалось снять мут после /unban")
+                await message.answer(f"Не удалось снять мут. {_restriction_error(error)}")
+                return
+            await message.answer(f"С пользователя {_mention(user)} снят мут.")
+
     @local_router.message(Command("stats"))
     async def stats(message: Message, bot: Bot) -> None:
         if message.chat.type not in GROUP_TYPES:
+            return
+        if not await is_chat_admin(message, bot):
+            await message.answer("Команда /stats доступна только администраторам чата.")
             return
         warnings = []
         muted = []

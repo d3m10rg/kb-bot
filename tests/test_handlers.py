@@ -77,8 +77,10 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                 raise TelegramForbiddenError(method=method, message="no rights")
             self.mutes.append(method)
             if not self.ignore_mute:
-                self.members[method.user_id] = make_restricted(
-                    self.members[method.user_id].user, method.until_date
+                user = self.members[method.user_id].user
+                self.members[method.user_id] = (
+                    ChatMemberMember(user=user) if method.permissions.can_send_messages
+                    else make_restricted(user, method.until_date)
                 )
             return True
         return True
@@ -103,6 +105,76 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             self.bot, Update(update_id=self.sequence, message=message)
         )
         return message
+
+    async def prepare_unban(self):
+        await self.storage.remember_user(-100, 42, "member")
+        await self.storage.increment_admin_warning(-100, 42)
+        self.members[42] = make_restricted(self.user, int(time.time()) + 86400)
+        await self.storage.set_mute(-100, 42, time.time() + 86400)
+
+    async def test_unban_removes_mute_preserves_warnings_and_updates_stats(self):
+        await self.prepare_unban()
+        await self.feed(self.admin, "/unban @MeMbEr")
+        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут.")
+        self.assertIsNone(await self.storage.active_mute(-100, 42))
+        self.assertTrue(all(self.mutes[-1].permissions.model_dump().values()))
+        self.assertEqual((await self.storage.moderation_stats(-100))[0].warnings, 1)
+        await self.feed(self.admin, text="/stats")
+        self.assertIn("@member — предупреждений: 1", self.sent[-1].text)
+        self.assertNotIn("— разбан:", self.sent[-1].text)
+
+    async def test_unban_requires_admin(self):
+        await self.prepare_unban()
+        await self.feed(text="/unban @member")
+        self.assertIn("только администраторам", self.sent[-1].text)
+        self.assertFalse(self.mutes)
+        self.assertIsNotNone(await self.storage.active_mute(-100, 42))
+
+    async def test_unban_failure_keeps_saved_mute(self):
+        await self.prepare_unban()
+        self.deny_mute = True
+        await self.feed(self.admin, "/unban @member")
+        self.assertIn("Не удалось снять мут", self.sent[-1].text)
+        self.assertIsNotNone(await self.storage.active_mute(-100, 42))
+
+    async def test_unban_checks_telegram_confirmation(self):
+        await self.prepare_unban()
+        self.ignore_mute = True
+        await self.feed(self.admin, "/unban @member")
+        self.assertIn("не подтвердил", self.sent[-1].text)
+        self.assertIsNotNone(await self.storage.active_mute(-100, 42))
+
+    async def test_unban_stale_username_cannot_target_previous_owner(self):
+        await self.prepare_unban()
+        self.members[42] = make_restricted(
+            self.user.model_copy(update={"username": "renamed"}), int(time.time()) + 86400
+        )
+        await self.feed(self.admin, "/unban @member")
+        self.assertIn("изменилось", self.sent[-1].text)
+        self.assertFalse(self.mutes)
+
+    async def test_unban_reply_and_repeated_command(self):
+        await self.prepare_unban()
+        await self.feed(self.admin, "/unban", reply_to_message=self.message(text="hello"))
+        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут.")
+        await self.feed(self.admin, "/unban @member")
+        self.assertIn("нет мута", self.sent[-1].text)
+        self.assertEqual(len(self.mutes), 1)
+
+    async def test_unban_unknown_username(self):
+        await self.feed(self.admin, "/unban @unknown")
+        self.assertIn("ответом", self.sent[-1].text)
+        self.assertFalse(self.mutes)
+
+    async def test_unban_does_not_bypass_pending_captcha(self):
+        await self.prepare_unban()
+        await self.storage.add_challenge(Challenge(
+            token="pending", chat_id=-100, user_id=42, answer=2, deadline=time.time() + 60,
+        ))
+        await self.feed(self.admin, "/unban @member")
+        self.assertIn("пройти капчу", self.sent[-1].text)
+        self.assertFalse(self.mutes)
+        self.assertIsNotNone(await self.storage.active_mute(-100, 42))
 
     async def test_three_admin_warnings_mute_for_a_day_and_keep_count(self):
         await self.feed(text="hello")
@@ -364,6 +436,25 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.mutes), 1)
         self.assertAlmostEqual(await self.storage.active_mute(-100, 42), time.time() + 86400, delta=3)
 
+    async def test_stats_requires_admin_and_does_not_expose_data(self):
+        await self.prepare_unban()
+        await self.feed(text="/stats")
+        self.assertEqual(self.sent[-1].text, "Команда /stats доступна только администраторам чата.")
+        self.assertNotIn("@member", self.sent[-1].text)
+
+    async def test_stats_trusts_only_anonymous_admin_of_this_group(self):
+        await self.feed(text="/stats", sender_chat=Chat(id=-200, type="channel"))
+        self.assertIn("только администраторам", self.sent[-1].text)
+        await self.feed(text="/stats", sender_chat=self.chat)
+        self.assertIn("Предупреждения (1–2)", self.sent[-1].text)
+
+    async def test_unban_trusts_only_anonymous_admin_of_this_group(self):
+        await self.prepare_unban()
+        await self.feed(text="/unban @member", sender_chat=Chat(id=-200, type="channel"))
+        self.assertFalse(self.mutes)
+        await self.feed(text="/unban @member", sender_chat=self.chat)
+        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут.")
+
     async def test_stats_has_warning_and_mute_sections_scoped_to_chat(self):
         now = int(time.time())
         for user_id, count, until in [(42, 1, None), (43, 2, None), (44, 3, now + 86400), (45, 0, now + 300)]:
@@ -375,7 +466,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             if until:
                 await self.storage.set_mute(-100, user_id, until)
         await self.storage.increment_admin_warning(-200, 99)
-        await self.feed(text="/stats")
+        await self.feed(self.admin, text="/stats")
         warned, muted = self.sent[-1].text.split("<b>Забаненные пользователи (мут):</b>")
         self.assertIn("@member42", warned)
         self.assertIn("@member43", warned)
@@ -390,7 +481,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_stats_removes_expired_and_early_lifted_mutes(self):
         for until in [time.time() - 10, time.time() + 86400]:
             await self.storage.set_mute(-100, 42, until)
-            await self.feed(text="/stats")
+            await self.feed(self.admin, text="/stats")
             self.assertNotIn("разбан:", self.sent[-1].text)
             self.assertIsNone(await self.storage.active_mute(-100, 42))
 
@@ -399,18 +490,18 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             await self.storage.increment_admin_warning(-100, 42)
         until = int(time.time()) + 86400
         self.members[42] = make_restricted(self.user, until)
-        await self.feed(text="/stats")
+        await self.feed(self.admin, text="/stats")
         self.assertIn("@member — разбан:", self.sent[-1].text)
         self.assertEqual(await self.storage.active_mute(-100, 42), until)
 
     async def test_stats_shows_indefinite_mute_but_not_captcha(self):
         await self.storage.increment_admin_warning(-100, 42)
         self.members[42] = make_restricted(self.user, 0)
-        await self.feed(text="/stats")
+        await self.feed(self.admin, text="/stats")
         self.assertIn("разбан: бессрочно", self.sent[-1].text)
         await self.storage.clear_mute(-100, 42)
         await self.storage.add_challenge(Challenge("pending", -100, 42, 7, time.time() + 60))
-        await self.feed(text="/stats")
+        await self.feed(self.admin, text="/stats")
         self.assertNotIn("разбан:", self.sent[-1].text)
 
     async def test_stats_splits_long_lists_without_dropping_users(self):
@@ -418,7 +509,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             user = User(id=user_id, is_bot=False, first_name="User", username=f"member{user_id}")
             self.members[user_id] = ChatMemberMember(user=user)
             await self.storage.increment_admin_warning(-100, user_id)
-        await self.feed(text="/stats")
+        await self.feed(self.admin, text="/stats")
         self.assertGreater(len(self.sent), 1)
         self.assertTrue(all(len(m.text) <= 3500 for m in self.sent))
         combined = "\n".join(m.text for m in self.sent)
@@ -434,6 +525,6 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             new_chat_member=self.members[42],
         )
         await self.dispatcher.feed_update(self.bot, Update(update_id=100, chat_member=event))
-        await self.feed(text="/stats")
+        await self.feed(self.admin, text="/stats")
         self.assertIn("@member — разбан:", self.sent[-1].text)
         self.assertEqual(await self.storage.active_mute(-100, 42), until)
