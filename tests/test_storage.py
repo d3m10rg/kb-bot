@@ -43,6 +43,21 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await reopened.increment_admin_warning(-100, 99), 1)
         self.assertEqual(await reopened.increment_warning(-100, 42), 1)
 
+    async def test_unban_reset_persists_and_only_affects_target_in_this_chat(self):
+        for chat_id, user_id in [(-100, 42), (-200, 42), (-100, 99)]:
+            await self.storage.increment_admin_warning(chat_id, user_id, "reason")
+            await self.storage.set_mute(chat_id, user_id, time.time() + 300)
+        await self.storage.increment_warning(-100, 42)
+        await self.storage.clear_mute_and_admin_warnings(-100, 42)
+        reopened = Storage(str(Path(self.temp_dir.name) / "test.sqlite3"))
+        await reopened.initialize()
+        self.assertIsNone(await reopened.active_mute(-100, 42))
+        self.assertEqual(await reopened.increment_admin_warning(-100, 42), 1)
+        for chat_id, user_id in [(-200, 42), (-100, 99)]:
+            self.assertIsNotNone(await reopened.active_mute(chat_id, user_id))
+            self.assertEqual(await reopened.increment_admin_warning(chat_id, user_id), 2)
+        self.assertEqual(await reopened.increment_warning(-100, 42), 2)
+
     async def test_username_rename_removal_and_reassignment(self):
         await self.storage.remember_user(-100, 42, "Member")
         self.assertEqual(await self.storage.find_user_id(-100, "MEMBER"), 42)

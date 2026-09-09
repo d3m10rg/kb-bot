@@ -1,7 +1,15 @@
 import random
 import unittest
 
-from app.domain import contains_points_word, make_math_problem
+from app.domain import contains_points_word, is_jackpot, make_math_problem
+
+
+class JackpotTests(unittest.TestCase):
+    def test_only_maximum_result_wins_for_every_game(self):
+        for emoji, maximum in [("🎰", 64), ("🎲", 6), ("🎯", 6), ("🎳", 6), ("🏀", 5), ("⚽", 5)]:
+            for value in range(0, maximum + 2):
+                with self.subTest(emoji=emoji, value=value):
+                    self.assertEqual(is_jackpot(emoji, value), value == maximum)
 
 
 class MathProblemTests(unittest.TestCase):

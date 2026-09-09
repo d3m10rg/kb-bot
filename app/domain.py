@@ -5,6 +5,8 @@ import re
 from dataclasses import dataclass
 from random import Random
 
+# Bot API dice.value starts at 1: 777 is 64 (the zero-based packed value is 63).
+# https://core.telegram.org/api/dice#slot-machine
 JACKPOT_VALUES = {"🎰": 64, "🎲": 6, "🎯": 6, "🎳": 6, "🏀": 5, "⚽": 5}
 
 

@@ -252,6 +252,19 @@ class Storage:
                     "DELETE FROM mutes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
                 )
 
+    async def clear_mute_and_admin_warnings(self, chat_id: int, user_id: int) -> None:
+        """Start a new warning cycle after an administrator confirms an unmute."""
+        async with self._lock:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM mutes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+                )
+                connection.execute(
+                    "DELETE FROM admin_warnings WHERE chat_id = ? AND user_id = ?",
+                    (chat_id, user_id),
+                )
+
     async def active_mute(self, chat_id: int, user_id: int) -> float | None:
         async with self._lock:
             with self._connect() as connection:

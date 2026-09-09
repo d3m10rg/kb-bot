@@ -112,16 +112,37 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.members[42] = make_restricted(self.user, int(time.time()) + 86400)
         await self.storage.set_mute(-100, 42, time.time() + 86400)
 
-    async def test_unban_removes_mute_preserves_warnings_and_updates_stats(self):
+    async def test_unban_removes_mute_resets_warnings_and_updates_stats(self):
         await self.prepare_unban()
         await self.feed(self.admin, "/unban @MeMbEr")
-        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут.")
+        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут. Предупреждения сброшены.")
         self.assertIsNone(await self.storage.active_mute(-100, 42))
         self.assertTrue(all(self.mutes[-1].permissions.model_dump().values()))
-        self.assertEqual((await self.storage.moderation_stats(-100))[0].warnings, 1)
+        self.assertEqual(await self.storage.moderation_stats(-100), [])
         await self.feed(self.admin, text="/stats")
-        self.assertIn("@member — предупреждений: 1", self.sent[-1].text)
+        self.assertNotIn("@member", self.sent[-1].text)
         self.assertNotIn("— разбан:", self.sent[-1].text)
+
+    async def test_unban_starts_full_three_warning_cycle(self):
+        await self.feed(text="hello")
+        for _ in range(3):
+            await self.feed(self.admin, "/warn @member")
+        await self.feed(self.admin, "/unban @member")
+        self.assertIsNone(await self.storage.active_mute(-100, 42))
+        self.mutes.clear()
+        for count in range(1, 4):
+            await self.feed(self.admin, "/warn @member новая причина")
+            self.assertIn(f"Осталось предупреждений до бана: {3 - count}", self.sent[-1].text)
+            self.assertEqual(len(self.mutes), int(count == 3))
+
+    async def test_unban_resets_warnings_after_mute_already_lifted(self):
+        await self.prepare_unban()
+        self.members[42] = ChatMemberMember(user=self.user)
+        await self.feed(self.admin, "/unban @member")
+        self.assertIn("Предупреждения сброшены", self.sent[-1].text)
+        await self.feed(self.admin, "/warn @member")
+        self.assertIn("Осталось предупреждений до бана: 2", self.sent[-1].text)
+        self.assertFalse(self.mutes)
 
     async def test_unban_requires_admin(self):
         await self.prepare_unban()
@@ -137,12 +158,16 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Не удалось снять мут", self.sent[-1].text)
         self.assertIsNotNone(await self.storage.active_mute(-100, 42))
 
+        self.assertEqual((await self.storage.moderation_stats(-100))[0].warnings, 1)
+
     async def test_unban_checks_telegram_confirmation(self):
         await self.prepare_unban()
         self.ignore_mute = True
         await self.feed(self.admin, "/unban @member")
         self.assertIn("не подтвердил", self.sent[-1].text)
         self.assertIsNotNone(await self.storage.active_mute(-100, 42))
+
+        self.assertEqual((await self.storage.moderation_stats(-100))[0].warnings, 1)
 
     async def test_unban_stale_username_cannot_target_previous_owner(self):
         await self.prepare_unban()
@@ -156,7 +181,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unban_reply_and_repeated_command(self):
         await self.prepare_unban()
         await self.feed(self.admin, "/unban", reply_to_message=self.message(text="hello"))
-        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут.")
+        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут. Предупреждения сброшены.")
         await self.feed(self.admin, "/unban @member")
         self.assertIn("нет мута", self.sent[-1].text)
         self.assertEqual(len(self.mutes), 1)
@@ -453,7 +478,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.feed(text="/unban @member", sender_chat=Chat(id=-200, type="channel"))
         self.assertFalse(self.mutes)
         await self.feed(text="/unban @member", sender_chat=self.chat)
-        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут.")
+        self.assertEqual(self.sent[-1].text, "С пользователя @member снят мут. Предупреждения сброшены.")
 
     async def test_stats_has_warning_and_mute_sections_scoped_to_chat(self):
         now = int(time.time())

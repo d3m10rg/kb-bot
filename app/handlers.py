@@ -219,8 +219,8 @@ def register_handlers(
                     await message.answer("Сначала пользователь должен пройти капчу. Затем повторите /unban.")
                     return
                 if target.status != ChatMemberStatus.RESTRICTED:
-                    await storage.clear_mute(message.chat.id, user.id)
-                    await message.answer(f"У пользователя {_mention(user)} нет мута.")
+                    await storage.clear_mute_and_admin_warnings(message.chat.id, user.id)
+                    await message.answer(f"У пользователя {_mention(user)} нет мута. Предупреждения сброшены.")
                     return
                 # Telegram lifts individual restrictions when all permissions are True.
                 result = await bot.restrict_chat_member(
@@ -234,12 +234,12 @@ def register_handlers(
                 confirmed = await bot.get_chat_member(message.chat.id, user.id)
                 if not result or confirmed.status == ChatMemberStatus.RESTRICTED:
                     raise ModerationError("Telegram не подтвердил снятие ограничений.")
-                await storage.clear_mute(message.chat.id, user.id)
+                await storage.clear_mute_and_admin_warnings(message.chat.id, user.id)
             except (ModerationError, TelegramAPIError) as error:
                 logger.exception("Не удалось снять мут после /unban")
                 await message.answer(f"Не удалось снять мут. {_restriction_error(error)}")
                 return
-            await message.answer(f"С пользователя {_mention(user)} снят мут.")
+            await message.answer(f"С пользователя {_mention(user)} снят мут. Предупреждения сброшены.")
 
     @local_router.message(Command("stats"))
     async def stats(message: Message, bot: Bot) -> None:
