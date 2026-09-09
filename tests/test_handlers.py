@@ -11,12 +11,12 @@ from unittest.mock import AsyncMock
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import DeleteMessage, GetChatMember, GetMe, RestrictChatMember, SendMessage
-from aiogram.types import Chat, ChatMemberMember, ChatMemberOwner, Message, Update, User
+from aiogram.types import Chat, ChatMemberAdministrator, ChatMemberMember, ChatMemberOwner, ChatMemberUpdated, Message, Update, User
 
 from app.cleanup import MessageCleanup
 from app.handlers import register_handlers
-from app.storage import Storage
-from tests.test_moderation import make_settings
+from app.storage import Challenge, Storage
+from tests.test_moderation import make_restricted, make_settings
 
 
 class HandlerTests(unittest.IsolatedAsyncioTestCase):
@@ -32,11 +32,15 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.members = {
             1: ChatMemberOwner(user=self.admin, is_anonymous=False),
             42: ChatMemberMember(user=self.user),
-            123: ChatMemberMember(user=self.bot_user),
+            123: ChatMemberAdministrator(
+                user=self.bot_user, is_anonymous=False,
+                **{name: name == "can_restrict_members" for name in ChatMemberAdministrator.model_fields if name.startswith("can_")},
+            ),
         }
         self.sent = []
         self.mutes = []
         self.deny_mute = False
+        self.ignore_mute = False
         self.bot.session.make_request = AsyncMock(side_effect=self.request)
         self.cleanup = MessageCleanup(self.bot, self.storage)
         self.bot.session.middleware(self.cleanup.track_sent_messages)
@@ -72,10 +76,10 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             if self.deny_mute:
                 raise TelegramForbiddenError(method=method, message="no rights")
             self.mutes.append(method)
-            self.members[method.user_id] = SimpleNamespace(
-                status="restricted", user=self.members[method.user_id].user,
-                is_member=True, can_send_messages=False, until_date=method.until_date,
-            )
+            if not self.ignore_mute:
+                self.members[method.user_id] = make_restricted(
+                    self.members[method.user_id].user, method.until_date
+                )
             return True
         return True
 
@@ -104,19 +108,23 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.feed(text="hello")
         for count in range(1, 4):
             await self.feed(self.admin, "/warn @MeMbEr")
-            self.assertEqual(
-                self.sent[-1].text,
-                f"Пользователю @member дано предупреждение. Количество предупреждений: {count}",
+            expected = (
+                "Пользователю @member дано предупреждение.\n"
+                f"Осталось предупреждений до бана: {3 - count}"
             )
+            if count == 3:
+                expected += "\n\n@member, ты видимо с 3 раза не понял, посиди в бане на сутки"
+            self.assertEqual(self.sent[-1].text, expected)
             self.assertEqual(len(self.mutes), int(count == 3))
-        self.assertAlmostEqual(self.mutes[0].until_date.timestamp(), time.time() + 86400, delta=3)
+        self.assertAlmostEqual(self.mutes[0].until_date, time.time() + 86400, delta=3)
         self.assertTrue(self.mutes[0].use_independent_chat_permissions)
         self.assertTrue(all(
             value is False for name, value in self.mutes[0].permissions.model_dump().items()
             if name.startswith("can_send")
         ))
         await self.feed(self.admin, "/warn @member")
-        self.assertIn("предупреждений: 4", self.sent[-1].text)
+        self.assertIn("Осталось предупреждений до бана: 0", self.sent[-1].text)
+        self.assertEqual((await self.storage.moderation_stats(-100))[0].warnings, 4)
 
     async def test_non_admin_cannot_warn(self):
         await self.feed(text="/warn @admin")
@@ -155,7 +163,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         await self.feed(text="/warn @member", sender_chat=Chat(id=-200, type="channel"))
         self.assertIn("только администраторам", self.sent[-1].text)
         await self.feed(text="/warn @member", sender_chat=self.chat)
-        self.assertIn("предупреждений: 1", self.sent[-1].text)
+        self.assertIn("Осталось предупреждений до бана: 2", self.sent[-1].text)
 
     async def test_mute_error_preserves_warning_and_reports_failure(self):
         await self.feed(text="hello")
@@ -164,13 +172,14 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.deny_mute = True
         with self.assertLogs("app.handlers", level="ERROR"):
             await self.feed(self.admin, "/warn @member")
-        self.assertIn("предупреждений: 3", self.sent[-1].text)
+        self.assertIn("Осталось предупреждений до бана: 0", self.sent[-1].text)
         self.assertIn("Не удалось выдать мут", self.sent[-1].text)
+        self.assertNotIn("посиди в бане", self.sent[-1].text)
 
     async def test_concurrent_warnings_are_counted_once_each(self):
         await self.feed(text="hello")
         await asyncio.gather(*(self.feed(self.admin, "/warn @member") for _ in range(3)))
-        self.assertEqual([m.text.rsplit(": ", 1)[1] for m in self.sent], ["1", "2", "3"])
+        self.assertEqual([m.text.split(": ", 1)[1].splitlines()[0] for m in self.sent], ["2", "1", "0"])
         self.assertEqual(len(self.mutes), 1)
 
     async def test_all_games_delete_after_a_minute_and_maximum_mutes(self):
@@ -188,7 +197,9 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
                     await self.storage.due_deletions(message.date.timestamp() + 60),
                 )
                 self.assertEqual(len(self.mutes), 1)
-                self.assertAlmostEqual(self.mutes[0].until_date.timestamp(), time.time() + 300, delta=3)
+                self.assertAlmostEqual(self.mutes[0].until_date, time.time() + 300, delta=3)
+                self.assertEqual(self.sent[-1].text, "Поздравляю с успешным депом, вот тебе мут на 5 минут")
+                self.assertEqual(await self.storage.active_mute(-100, 42), self.mutes[0].until_date)
 
     async def test_losing_and_forwarded_games_are_only_deleted(self):
         for emoji, maximum in [("🎰", 64), ("🎲", 6), ("🎯", 6), ("🎳", 6), ("🏀", 5), ("⚽", 5)]:
@@ -201,9 +212,11 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await self.storage.due_deletions(time.time() + 61)), 7)
 
     async def test_admin_jackpot_is_deleted_without_attempting_to_mute(self):
-        await self.feed(self.admin, dice=dict(emoji="🎲", value=6))
+        with self.assertLogs("app.handlers", level="ERROR"):
+            await self.feed(self.admin, dice=dict(emoji="🎲", value=6))
         self.assertFalse(self.mutes)
-        self.assertEqual(len(await self.storage.due_deletions(time.time() + 61)), 1)
+        self.assertIn("не позволяет", self.sent[-1].text)
+        self.assertEqual(len(await self.storage.due_deletions(time.time() + 61)), 2)
 
     async def test_jackpot_cannot_shorten_day_mute(self):
         await self.feed(text="hello")
@@ -219,7 +232,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             await self.feed(text="баллы")
         self.assertEqual([m.text for m in self.sent[1:]], ["one", "two", "three"])
         self.assertEqual(len(self.mutes), 1)
-        self.assertAlmostEqual(self.mutes[0].until_date.timestamp(), time.time() + 600, delta=3)
+        self.assertAlmostEqual(self.mutes[0].until_date, time.time() + 600, delta=3)
         self.assertEqual(await self.storage.increment_warning(-100, 42), 1)
         self.assertEqual(await self.storage.increment_admin_warning(-100, 42), 2)
         self.assertEqual(len(await self.storage.due_deletions(time.time() + 61)), 4)
@@ -227,8 +240,8 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_command_suffix_and_malformed_command(self):
         await self.feed(text="hello")
         await self.feed(self.admin, "/warn@kb_test_bot @member")
-        self.assertIn("предупреждений: 1", self.sent[-1].text)
-        await self.feed(self.admin, "/warn @member @admin")
+        self.assertIn("Осталось предупреждений до бана: 2", self.sent[-1].text)
+        await self.feed(self.admin, "/warn @<member>")
         self.assertIn("Используйте", self.sent[-1].text)
 
     async def test_private_dice_is_ignored(self):
@@ -281,3 +294,146 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertEqual(len(deletions), expected_deletions)
         self.assertEqual(await self.storage.due_deletions(time.time() + 61), [])
+
+    async def test_warn_with_reason_matches_requested_text(self):
+        await self.feed(text="hello")
+        await self.feed(self.admin, "/warn @member за мат в чате")
+        self.assertEqual(self.sent[-1].text,
+            "Пользователю @member дано предупреждение.\n"
+            "Причина: за мат в чате\nОсталось предупреждений до бана: 2")
+
+    async def test_reply_warn_reason_escapes_html(self):
+        await self.feed(self.admin, "/warn за <b>мат</b> & флуд", reply_to_message=self.message(text="hello"))
+        self.assertIn("Причина: за &lt;b&gt;мат&lt;/b&gt; &amp; флуд", self.sent[-1].text)
+
+    async def test_long_reason_is_preserved_across_messages(self):
+        import html
+        reason = "<" * 3800
+        await self.feed(text="hello")
+        await self.feed(self.admin, "/warn @member " + reason)
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(sum(html.unescape(m.text).count("<") for m in self.sent), len(reason))
+        self.assertTrue(all(len(html.unescape(m.text)) <= 4096 for m in self.sent))
+
+    async def test_partial_indefinite_restriction_does_not_skip_jackpot_mute(self):
+        self.members[42] = make_restricted(self.user, 0, can_send_other_messages=True)
+        await self.feed(dice=dict(emoji="🎲", value=6))
+        self.assertEqual(len(self.mutes), 1)
+        self.assertAlmostEqual(self.mutes[0].until_date, time.time() + 300, delta=3)
+        self.assertFalse(self.members[42].can_send_other_messages)
+        self.assertIn("Поздравляю с успешным депом", self.sent[-1].text)
+
+    async def test_jackpot_api_failure_is_visible_without_false_congratulation(self):
+        self.deny_mute = True
+        with self.assertLogs("app.handlers", level="ERROR"):
+            await self.feed(dice=dict(emoji="🎰", value=64))
+        self.assertIn("Мут не выдан", self.sent[-1].text)
+        self.assertIn("no rights", self.sent[-1].text)
+        self.assertNotIn("вот тебе мут", self.sent[-1].text)
+        self.assertIsNone(await self.storage.active_mute(-100, 42))
+
+    async def test_jackpot_checks_bot_rights(self):
+        self.members[123] = self.members[123].model_copy(update={"can_restrict_members": False})
+        with self.assertLogs("app.handlers", level="ERROR"):
+            await self.feed(dice=dict(emoji="🎯", value=6))
+        self.assertIn("разрешением ограничивать участников", self.sent[-1].text)
+        self.assertFalse(self.mutes)
+
+    async def test_jackpot_verifies_actual_member_permissions(self):
+        self.ignore_mute = True
+        with self.assertLogs("app.handlers", level="ERROR"):
+            await self.feed(dice=dict(emoji="🎳", value=6))
+        self.assertIn("Telegram не подтвердил мут", self.sent[-1].text)
+        self.assertIsNone(await self.storage.active_mute(-100, 42))
+
+    async def test_group_jackpot_explains_supergroup_requirement(self):
+        await self.feed(chat=Chat(id=-100, type="group"), dice=dict(emoji="🎲", value=6))
+        self.assertIn("только в супергруппе", self.sent[-1].text)
+        self.assertFalse(self.mutes)
+
+    async def test_emoji_variation_selector_still_triggers_jackpot(self):
+        await self.feed(dice=dict(emoji="⚽\ufe0f", value=5))
+        self.assertEqual(len(self.mutes), 1)
+
+    async def test_warning_during_captcha_sets_a_finite_day_mute(self):
+        await self.storage.add_challenge(Challenge("captcha", -100, 42, 7, time.time() + 60))
+        self.members[42] = make_restricted(self.user, 0)
+        await self.storage.increment_admin_warning(-100, 42)
+        await self.storage.increment_admin_warning(-100, 42)
+        await self.feed(self.admin, "/warn", reply_to_message=self.message(text="hi"))
+        self.assertEqual(len(self.mutes), 1)
+        self.assertAlmostEqual(await self.storage.active_mute(-100, 42), time.time() + 86400, delta=3)
+
+    async def test_stats_has_warning_and_mute_sections_scoped_to_chat(self):
+        now = int(time.time())
+        for user_id, count, until in [(42, 1, None), (43, 2, None), (44, 3, now + 86400), (45, 0, now + 300)]:
+            user = User(id=user_id, is_bot=False, first_name="User", username=f"member{user_id}")
+            self.members[user_id] = ChatMemberMember(user=user) if until is None else make_restricted(user, until)
+            await self.storage.remember_user(-100, user_id, user.username)
+            for _ in range(count):
+                await self.storage.increment_admin_warning(-100, user_id)
+            if until:
+                await self.storage.set_mute(-100, user_id, until)
+        await self.storage.increment_admin_warning(-200, 99)
+        await self.feed(text="/stats")
+        warned, muted = self.sent[-1].text.split("<b>Забаненные пользователи (мут):</b>")
+        self.assertIn("@member42", warned)
+        self.assertIn("@member43", warned)
+        self.assertNotIn("@member44", warned)
+        self.assertNotIn("@member45", warned)
+        self.assertIn("@member44", muted)
+        self.assertIn("@member45", muted)
+        self.assertIn("МСК", muted)
+        self.assertNotIn("99", self.sent[-1].text)
+        self.assertIn((-100, self.sent[-1].message_id), await self.storage.due_deletions(time.time() + 61))
+
+    async def test_stats_removes_expired_and_early_lifted_mutes(self):
+        for until in [time.time() - 10, time.time() + 86400]:
+            await self.storage.set_mute(-100, 42, until)
+            await self.feed(text="/stats")
+            self.assertNotIn("разбан:", self.sent[-1].text)
+            self.assertIsNone(await self.storage.active_mute(-100, 42))
+
+    async def test_stats_discovers_existing_day_mute_from_old_warning_counter(self):
+        for _ in range(3):
+            await self.storage.increment_admin_warning(-100, 42)
+        until = int(time.time()) + 86400
+        self.members[42] = make_restricted(self.user, until)
+        await self.feed(text="/stats")
+        self.assertIn("@member — разбан:", self.sent[-1].text)
+        self.assertEqual(await self.storage.active_mute(-100, 42), until)
+
+    async def test_stats_shows_indefinite_mute_but_not_captcha(self):
+        await self.storage.increment_admin_warning(-100, 42)
+        self.members[42] = make_restricted(self.user, 0)
+        await self.feed(text="/stats")
+        self.assertIn("разбан: бессрочно", self.sent[-1].text)
+        await self.storage.clear_mute(-100, 42)
+        await self.storage.add_challenge(Challenge("pending", -100, 42, 7, time.time() + 60))
+        await self.feed(text="/stats")
+        self.assertNotIn("разбан:", self.sent[-1].text)
+
+    async def test_stats_splits_long_lists_without_dropping_users(self):
+        for user_id in range(100, 180):
+            user = User(id=user_id, is_bot=False, first_name="User", username=f"member{user_id}")
+            self.members[user_id] = ChatMemberMember(user=user)
+            await self.storage.increment_admin_warning(-100, user_id)
+        await self.feed(text="/stats")
+        self.assertGreater(len(self.sent), 1)
+        self.assertTrue(all(len(m.text) <= 3500 for m in self.sent))
+        combined = "\n".join(m.text for m in self.sent)
+        for user_id in range(100, 180):
+            self.assertEqual(combined.count(f"@member{user_id} —"), 1)
+
+    async def test_member_update_records_manual_mute_for_stats(self):
+        until = int(time.time()) + 600
+        self.members[42] = make_restricted(self.user, until)
+        event = ChatMemberUpdated(
+            chat=self.chat, from_user=self.admin, date=int(time.time()),
+            old_chat_member=ChatMemberMember(user=self.user),
+            new_chat_member=self.members[42],
+        )
+        await self.dispatcher.feed_update(self.bot, Update(update_id=100, chat_member=event))
+        await self.feed(text="/stats")
+        self.assertIn("@member — разбан:", self.sent[-1].text)
+        self.assertEqual(await self.storage.active_mute(-100, 42), until)

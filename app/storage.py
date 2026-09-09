@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,12 +19,21 @@ class Challenge:
     message_id: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ModerationStats:
+    user_id: int
+    username: str | None
+    warnings: int
+    muted_until: float | None
+
+
 class Storage:
     """Small SQLite repository; all operations are serialized in-process."""
 
     def __init__(self, path: str) -> None:
         self._path = path
         self._lock = asyncio.Lock()
+        self.moderation_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         parent = Path(self._path).expanduser().resolve().parent
@@ -52,6 +62,7 @@ class Storage:
                         chat_id INTEGER NOT NULL,
                         user_id INTEGER NOT NULL,
                         count INTEGER NOT NULL,
+                        reason TEXT,
                         PRIMARY KEY(chat_id, user_id)
                     );
                     CREATE TABLE IF NOT EXISTS chat_users (
@@ -67,8 +78,19 @@ class Storage:
                         delete_at REAL NOT NULL,
                         PRIMARY KEY(chat_id, message_id)
                     );
+                    CREATE TABLE IF NOT EXISTS mutes (
+                        chat_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        until_date REAL NOT NULL,
+                        PRIMARY KEY(chat_id, user_id)
+                    );
                     """
                 )
+                columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(admin_warnings)")
+                }
+                if "reason" not in columns:
+                    connection.execute("ALTER TABLE admin_warnings ADD COLUMN reason TEXT")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -155,6 +177,15 @@ class Storage:
                 rows = connection.execute("SELECT * FROM challenges").fetchall()
         return [_challenge_from_row(row) for row in rows]
 
+    async def has_challenge(self, chat_id: int, user_id: int) -> bool:
+        async with self._lock:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT 1 FROM challenges WHERE chat_id = ? AND user_id = ?",
+                    (chat_id, user_id),
+                ).fetchone()
+        return row is not None
+
     async def increment_warning(self, chat_id: int, user_id: int) -> int:
         async with self._lock:
             with self._connect() as connection:
@@ -182,23 +213,77 @@ class Storage:
                     (chat_id, user_id),
                 )
 
-    async def increment_admin_warning(self, chat_id: int, user_id: int) -> int:
+    async def increment_admin_warning(
+        self, chat_id: int, user_id: int, reason: str | None = None
+    ) -> int:
         async with self._lock:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute(
                     """
-                    INSERT INTO admin_warnings (chat_id, user_id, count)
-                    VALUES (?, ?, 1)
-                    ON CONFLICT(chat_id, user_id) DO UPDATE SET count = count + 1
+                    INSERT INTO admin_warnings (chat_id, user_id, count, reason)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(chat_id, user_id)
+                    DO UPDATE SET count = count + 1, reason = excluded.reason
                     """,
-                    (chat_id, user_id),
+                    (chat_id, user_id, reason),
                 )
                 row = connection.execute(
                     "SELECT count FROM admin_warnings WHERE chat_id = ? AND user_id = ?",
                     (chat_id, user_id),
                 ).fetchone()
         return int(row["count"])
+
+    async def set_mute(self, chat_id: int, user_id: int, until_date: float) -> None:
+        async with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO mutes (chat_id, user_id, until_date) VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id, user_id) DO UPDATE SET until_date = excluded.until_date
+                    """,
+                    (chat_id, user_id, until_date),
+                )
+
+    async def clear_mute(self, chat_id: int, user_id: int) -> None:
+        async with self._lock:
+            with self._connect() as connection:
+                connection.execute(
+                    "DELETE FROM mutes WHERE chat_id = ? AND user_id = ?", (chat_id, user_id)
+                )
+
+    async def active_mute(self, chat_id: int, user_id: int) -> float | None:
+        async with self._lock:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT until_date FROM mutes WHERE chat_id = ? AND user_id = ? "
+                    "AND (until_date = 0 OR until_date > ?)",
+                    (chat_id, user_id, time.time()),
+                ).fetchone()
+        return float(row["until_date"]) if row else None
+
+    async def moderation_stats(self, chat_id: int) -> list[ModerationStats]:
+        async with self._lock:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT ids.user_id, u.username, COALESCE(w.count, 0) AS warnings,
+                           m.until_date
+                    FROM (
+                        SELECT user_id FROM admin_warnings WHERE chat_id = ? AND count > 0
+                        UNION SELECT user_id FROM mutes WHERE chat_id = ?
+                    ) AS ids
+                    LEFT JOIN admin_warnings w ON w.chat_id = ? AND w.user_id = ids.user_id
+                    LEFT JOIN chat_users u ON u.chat_id = ? AND u.user_id = ids.user_id
+                    LEFT JOIN mutes m ON m.chat_id = ? AND m.user_id = ids.user_id
+                    ORDER BY ids.user_id
+                    """,
+                    (chat_id, chat_id, chat_id, chat_id, chat_id),
+                ).fetchall()
+        return [ModerationStats(
+            user_id=int(row["user_id"]), username=row["username"],
+            warnings=int(row["warnings"]), muted_until=row["until_date"],
+        ) for row in rows]
 
     async def remember_user(
         self, chat_id: int, user_id: int, username: str | None

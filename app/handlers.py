@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-import asyncio
+import html
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatMemberStatus, ChatType
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import (
     ChatMemberUpdatedFilter, Command, CommandObject, JOIN_TRANSITION, LEAVE_TRANSITION,
 )
@@ -17,7 +19,7 @@ from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
 from app.cleanup import MessageCleanup
 from app.config import Settings
 from app.domain import contains_points_word, is_jackpot
-from app.moderation import CaptchaManager, _mention, mute_member
+from app.moderation import CaptchaManager, ModerationError, _mention, mute_deadline, mute_member
 from app.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -34,7 +36,7 @@ def register_handlers(
     cleanup: MessageCleanup,
 ) -> Router:
     local_router = Router(name="moderation")
-    moderation_lock = asyncio.Lock()
+    moderation_lock = storage.moderation_lock
 
     @local_router.message.outer_middleware()
     async def remember_sender(
@@ -60,6 +62,18 @@ def register_handlers(
         user = event.new_chat_member.user
         if event.chat.type in GROUP_TYPES and not user.is_bot:
             await storage.remember_user(event.chat.id, user.id, user.username)
+            async with moderation_lock:
+                if not await storage.has_challenge(event.chat.id, user.id):
+                    try:
+                        # Read current state; queued updates can describe an older restriction.
+                        member = await data["bot"].get_chat_member(event.chat.id, user.id)
+                        deadline = mute_deadline(member)
+                        if deadline is None:
+                            await storage.clear_mute(event.chat.id, user.id)
+                        else:
+                            await storage.set_mute(event.chat.id, user.id, deadline)
+                    except TelegramAPIError:
+                        logger.exception("Не удалось обновить состояние мута пользователя %s", user.id)
         return await handler(event, data)
 
     @local_router.message(Command("warn"))
@@ -82,12 +96,16 @@ def register_handlers(
             return
 
         username = None
+        reason = None
         reply = message.reply_to_message
-        if command.args:
-            if not re.fullmatch(r"@[A-Za-z0-9_]{1,32}", command.args.strip()):
-                await message.answer("Используйте /warn @username или /warn ответом на сообщение.")
+        args = (command.args or "").strip()
+        if args.startswith("@"):
+            parts = args.split(maxsplit=1)
+            if not re.fullmatch(r"@[A-Za-z0-9_]{1,32}", parts[0]):
+                await message.answer("Используйте /warn @username [причина] или /warn ответом на сообщение.")
                 return
-            username = command.args.strip()[1:]
+            username = parts[0][1:]
+            reason = parts[1].strip() if len(parts) == 2 else None
             user_id = await storage.find_user_id(message.chat.id, username)
             if (
                 reply and reply.from_user and not reply.sender_chat
@@ -96,8 +114,9 @@ def register_handlers(
                 user_id = reply.from_user.id
         elif reply and reply.from_user and not reply.sender_chat:
             user_id = reply.from_user.id
+            reason = args or None
         else:
-            await message.answer("Используйте /warn @username или /warn ответом на сообщение.")
+            await message.answer("Используйте /warn @username [причина] или /warn ответом на сообщение.")
             return
         if user_id is None:
             await message.answer(
@@ -127,18 +146,76 @@ def register_handlers(
                 await message.answer("Пользователь уже не состоит в чате.")
                 return
 
-            count = await storage.increment_admin_warning(message.chat.id, user.id)
-            text = (
-                f"Пользователю {_mention(user)} дано предупреждение. "
-                f"Количество предупреждений: {count}"
-            )
+            count = await storage.increment_admin_warning(message.chat.id, user.id, reason)
+            text = f"Пользователю {_mention(user)} дано предупреждение.\n"
+            if reason:
+                text += f"Причина: {html.escape(reason[:1500])}\n"
+            text += f"Осталось предупреждений до бана: {max(0, 3 - count)}"
             if count >= 3:
                 try:
-                    await mute_member(bot, message.chat.id, user.id, 24 * 60)
-                except (TelegramBadRequest, TelegramForbiddenError):
+                    await mute_member(bot, message.chat.id, user.id, 24 * 60, storage)
+                except (ModerationError, TelegramAPIError) as error:
                     logger.exception("Не удалось выдать мут после /warn")
-                    text += "\nНе удалось выдать мут на сутки. Проверьте права бота."
+                    text += f"\nНе удалось выдать мут на сутки. {_restriction_error(error)}"
+                else:
+                    text += (
+                        f"\n\n{_mention(user)}, ты видимо с 3 раза не понял, "
+                        "посиди в бане на сутки"
+                    )
             await message.answer(text)
+            if reason:
+                for offset in range(1500, len(reason), 1500):
+                    await message.answer(
+                        f"Причина (продолжение): {html.escape(reason[offset:offset + 1500])}"
+                    )
+
+    @local_router.message(Command("stats"))
+    async def stats(message: Message, bot: Bot) -> None:
+        if message.chat.type not in GROUP_TYPES:
+            return
+        warnings = []
+        muted = []
+        stale = False
+        for entry in await storage.moderation_stats(message.chat.id):
+            label = (
+                f"@{html.escape(entry.username)}" if entry.username
+                else f'<a href="tg://user?id={entry.user_id}">ID {entry.user_id}</a>'
+            )
+            until_date = entry.muted_until
+            eligible = True
+            async with moderation_lock:
+                try:
+                    member = await bot.get_chat_member(message.chat.id, entry.user_id)
+                    label = _mention(member.user)
+                    await storage.remember_user(
+                        message.chat.id, entry.user_id, member.user.username
+                    )
+                    eligible = member.status not in PRIVILEGED_STATUSES and not member.user.is_bot
+                    until_date = mute_deadline(member) if eligible else None
+                    # The temporary join captcha is not a moderation punishment.
+                    if until_date == 0 and await storage.has_challenge(message.chat.id, entry.user_id):
+                        until_date = await storage.active_mute(message.chat.id, entry.user_id)
+                    if until_date is None:
+                        await storage.clear_mute(message.chat.id, entry.user_id)
+                    else:
+                        await storage.set_mute(message.chat.id, entry.user_id, until_date)
+                except TelegramAPIError:
+                    logger.exception("Не удалось обновить /stats для пользователя %s", entry.user_id)
+                    stale = True
+            if eligible and 0 < entry.warnings < 3:
+                warnings.append(
+                    f"• {label} — предупреждений: {entry.warnings}; "
+                    f"осталось до бана: {3 - entry.warnings}"
+                )
+            if eligible and until_date is not None and (until_date == 0 or until_date > time.time()):
+                muted.append(f"• {label} — разбан: {_format_deadline(until_date)}")
+        lines = [
+            "<b>Предупреждения (1–2):</b>", *(warnings or ["Нет пользователей."]), "",
+            "<b>Забаненные пользователи (мут):</b>", *(muted or ["Нет пользователей."]),
+        ]
+        if stale:
+            lines += ["", "Не все ограничения удалось проверить в Telegram; для них показаны сохранённые данные."]
+        await _answer_lines(message, lines)
 
     @local_router.message(F.dice)
     async def dice_policy(message: Message, bot: Bot) -> None:
@@ -146,20 +223,31 @@ def register_handlers(
             return
         await cleanup.schedule(message)
         if (
-            message.chat.type != ChatType.SUPERGROUP
-            or message.from_user is None or message.from_user.is_bot
-            or message.sender_chat is not None or message.forward_origin is not None
+            message.from_user is None or message.from_user.is_bot
+            or message.forward_origin is not None
             or not is_jackpot(message.dice.emoji, message.dice.value)
         ):
             return
+        if message.chat.type != ChatType.SUPERGROUP:
+            await message.answer("Выигрыш! Мут не выдан: Telegram разрешает мутить участников только в супергруппе.")
+            return
+        if message.sender_chat is not None:
+            await message.answer("Выигрыш! Мут не выдан: сообщение отправлено от имени чата, а не пользователя.")
+            return
         async with moderation_lock:
             try:
-                member = await bot.get_chat_member(message.chat.id, message.from_user.id)
-                if member.status in PRIVILEGED_STATUSES:
-                    return
-                await mute_member(bot, message.chat.id, message.from_user.id, 5)
-            except (TelegramBadRequest, TelegramForbiddenError):
-                logger.exception("Не удалось выдать мут за джекпот")
+                until_date = await mute_member(bot, message.chat.id, message.from_user.id, 5, storage)
+            except (ModerationError, TelegramAPIError) as error:
+                logger.exception(
+                    "Не удалось выдать мут за джекпот: chat=%s user=%s emoji=%s value=%s",
+                    message.chat.id, message.from_user.id, message.dice.emoji, message.dice.value,
+                )
+                await message.answer(f"Выигрыш! Мут не выдан. {_restriction_error(error)}")
+            else:
+                text = "Поздравляю с успешным депом, вот тебе мут на 5 минут"
+                if until_date == 0 or until_date > time.time() + 301:
+                    text += "\nДействующий более долгий мут сохранён."
+                await message.answer(text)
 
     @local_router.message(F.new_chat_members)
     async def new_members(message: Message) -> None:
@@ -237,8 +325,34 @@ def register_handlers(
 
             if attempt == 3:
                 await mute_member(
-                    bot, message.chat.id, message.from_user.id, settings.mute_minutes
+                    bot, message.chat.id, message.from_user.id, settings.mute_minutes, storage
                 )
                 await storage.reset_warnings(message.chat.id, message.from_user.id)
 
     return local_router
+
+
+def _restriction_error(error: Exception) -> str:
+    if isinstance(error, ModerationError):
+        return html.escape(str(error))
+    detail = html.escape(error.message[:300])
+    return f"Проверьте права бота. Ответ Telegram: {detail}"
+
+
+def _format_deadline(timestamp: float) -> str:
+    if timestamp == 0:
+        return "бессрочно"
+    moscow = timezone(timedelta(hours=3))
+    return datetime.fromtimestamp(timestamp, moscow).strftime("%d.%m.%Y %H:%M:%S МСК")
+
+
+async def _answer_lines(message: Message, lines: list[str]) -> None:
+    # Keep HTML tags intact while staying below Telegram's message length limit.
+    chunk = ""
+    for line in lines:
+        if chunk and len(chunk) + len(line) + 1 > 3500:
+            await message.answer(chunk)
+            chunk = ""
+        chunk += ("\n" if chunk else "") + line
+    if chunk:
+        await message.answer(chunk)

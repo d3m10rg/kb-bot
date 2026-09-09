@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from aiogram.types import ChatPermissions
+from aiogram.types import ChatMemberRestricted, ChatPermissions, User
 
 from app.config import Settings
 from app.moderation import CaptchaManager
@@ -21,6 +21,12 @@ def make_settings() -> Settings:
         warning_texts=("one", "two", "three"),
         database_path=":memory:",
     )
+
+
+def make_restricted(user, until_date, **overrides):
+    permissions = {name: False for name in ChatMemberRestricted.model_fields if name.startswith("can_")}
+    permissions.update(overrides)
+    return ChatMemberRestricted(user=user, is_member=True, until_date=until_date, **permissions)
 
 
 class CaptchaManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -82,6 +88,40 @@ class CaptchaManagerTests(unittest.IsolatedAsyncioTestCase):
         self.bot.unban_chat_member.assert_awaited_once_with(
             chat_id=-100, user_id=42, only_if_banned=True
         )
+
+    async def test_correct_captcha_does_not_cancel_moderation_mute(self):
+        await self.add_challenge("muted")
+        until = int(time.time()) + 86400
+        await self.storage.set_mute(-100, 42, until)
+        self.bot.get_chat_member.return_value = make_restricted(
+            User(id=42, is_bot=False, first_name="Member"), until
+        )
+        self.assertEqual(await self.manager.resolve("muted", 42, 7), "correct")
+        self.bot.restrict_chat_member.assert_not_awaited()
+        self.assertEqual(await self.storage.active_mute(-100, 42), until)
+
+    async def test_captcha_restores_saved_mute_without_making_short_mute_permanent(self):
+        await self.add_challenge("short")
+        await self.storage.set_mute(-100, 42, time.time() + 10)
+        self.bot.get_chat_member.return_value = make_restricted(
+            User(id=42, is_bot=False, first_name="Member"), 0
+        )
+        self.assertEqual(await self.manager.resolve("short", 42, 7), "correct")
+        call = self.bot.restrict_chat_member.await_args.kwargs
+        self.assertFalse(call["permissions"].can_send_messages)
+        self.assertGreaterEqual(call["until_date"], int(time.time()) + 30)
+        self.assertLessEqual(call["until_date"], int(time.time()) + 31)
+
+    async def test_captcha_does_not_shorten_a_newer_longer_mute(self):
+        await self.add_challenge("longer")
+        await self.storage.set_mute(-100, 42, time.time() + 300)
+        until = int(time.time()) + 86400
+        self.bot.get_chat_member.return_value = make_restricted(
+            User(id=42, is_bot=False, first_name="Member"), until
+        )
+        self.assertEqual(await self.manager.resolve("longer", 42, 7), "correct")
+        self.bot.restrict_chat_member.assert_not_awaited()
+        self.assertEqual(await self.storage.active_mute(-100, 42), until)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from aiogram import Bot
 from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
+    ChatMember,
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -189,14 +190,36 @@ class CaptchaManager:
         )
 
     async def _restore_permissions(self, chat_id: int, user_id: int) -> None:
-        chat = await self._bot.get_chat(chat_id)
-        permissions = chat.permissions or FALLBACK_MEMBER_PERMISSIONS
-        await self._bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=permissions,
-            use_independent_chat_permissions=True,
-        )
+        async with self._storage.moderation_lock:
+            # Solving a captcha must not cancel a moderation mute issued meanwhile.
+            muted_until = await self._storage.active_mute(chat_id, user_id)
+            if muted_until is not None:
+                member = await self._bot.get_chat_member(chat_id, user_id)
+                current_until = mute_deadline(member)
+                if current_until == muted_until or (
+                    muted_until != 0 and current_until not in (None, 0)
+                    and current_until >= muted_until
+                ):
+                    await self._storage.set_mute(chat_id, user_id, current_until)
+                    return
+                # Telegram treats periods shorter than 30 seconds as permanent.
+                until_date = 0 if muted_until == 0 else max(muted_until, time.time() + 31)
+                await self._bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=user_id,
+                    permissions=NO_SEND_PERMISSIONS,
+                    use_independent_chat_permissions=True,
+                    until_date=int(until_date),
+                )
+                await self._storage.set_mute(chat_id, user_id, int(until_date))
+                return
+            chat = await self._bot.get_chat(chat_id)
+            permissions = chat.permissions or FALLBACK_MEMBER_PERMISSIONS
+            await self._bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=permissions,
+                use_independent_chat_permissions=True,
+            )
 
     async def _restore_permissions_safely(self, chat_id: int, user_id: int) -> None:
         try:
@@ -228,21 +251,58 @@ def mute_until(minutes: int) -> datetime:
     return datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
 
-async def mute_member(bot: Bot, chat_id: int, user_id: int, minutes: int) -> None:
+class ModerationError(Exception):
+    """A restriction that cannot be applied or was not confirmed by Telegram."""
+
+
+def mute_deadline(member: ChatMember) -> float | None:
+    if member.status != ChatMemberStatus.RESTRICTED:
+        return None
+    # A text-only restriction still allows dice, stickers or media. It is not a full mute.
+    if any(getattr(member, name, True) for name in NO_SEND_PERMISSIONS.model_dump(exclude_none=True)):
+        return None
+    deadline = member.until_date.timestamp()
+    return deadline if deadline == 0 or deadline > time.time() else None
+
+
+async def mute_member(
+    bot: Bot, chat_id: int, user_id: int, minutes: int, storage: Storage
+) -> float:
     member = await bot.get_chat_member(chat_id, user_id)
-    until_date = mute_until(minutes)
-    if member.status == ChatMemberStatus.RESTRICTED and not member.can_send_messages:
-        current_until = member.until_date
-        # A jackpot or the points policy must not shorten an existing day-long mute.
-        if current_until.timestamp() == 0 or current_until >= until_date:
-            return
-    await bot.restrict_chat_member(
+    if member.status in {ChatMemberStatus.CREATOR, ChatMemberStatus.ADMINISTRATOR}:
+        raise ModerationError("Telegram не позволяет боту мутить администратора или владельца чата.")
+    until_date = int(mute_until(minutes).timestamp())
+    current_until = mute_deadline(member)
+    pending_captcha = current_until == 0 and await storage.has_challenge(chat_id, user_id)
+    if current_until is not None and not pending_captcha:
+        # Preserve an existing full mute, including an indefinite one.
+        if current_until == 0 or current_until >= until_date:
+            await storage.set_mute(chat_id, user_id, current_until)
+            return current_until
+
+    bot_member = await bot.get_chat_member(chat_id, bot.id)
+    if bot_member.status != ChatMemberStatus.CREATOR and not (
+        bot_member.status == ChatMemberStatus.ADMINISTRATOR
+        and bot_member.can_restrict_members
+    ):
+        raise ModerationError(
+            "Боту нужны права администратора с разрешением ограничивать участников."
+        )
+    result = await bot.restrict_chat_member(
         chat_id=chat_id,
         user_id=user_id,
         permissions=NO_SEND_PERMISSIONS,
         use_independent_chat_permissions=True,
         until_date=until_date,
     )
+    confirmed = await bot.get_chat_member(chat_id, user_id)
+    confirmed_until = mute_deadline(confirmed)
+    if not result or confirmed_until is None or (
+        confirmed_until != 0 and confirmed_until < until_date
+    ):
+        raise ModerationError("Telegram не подтвердил мут. Проверьте права бота и повторите попытку.")
+    await storage.set_mute(chat_id, user_id, confirmed_until)
+    return confirmed_until
 
 
 def _answer_keyboard(token: str) -> InlineKeyboardMarkup:

@@ -9,7 +9,7 @@ JACKPOT_VALUES = {"🎰": 64, "🎲": 6, "🎯": 6, "🎳": 6, "🏀": 5, "⚽":
 
 
 def is_jackpot(emoji: str, value: int) -> bool:
-    return JACKPOT_VALUES.get(emoji) == value
+    return JACKPOT_VALUES.get(emoji.replace("\ufe0f", "").replace("\ufe0e", "")) == value
 
 
 # Все падежные формы существительного «балл» во множественном и единственном
